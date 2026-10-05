@@ -9,12 +9,13 @@
  * reste la version validee Phase 2).
  *
  * Horloge : le breakout PCM1808 a son propre quartz 24,576 MHz et ses
- * broches MD0/MD1 cablees en mode MAITRE 256 fs : c'est lui qui genere BCK
- * (6,144 MHz) et LRCK (fs = 96 kHz). L'ESP32 est donc ESCLAVE I2S : BCK et
+ * options en mode MAITRE : c'est lui qui genere BCK et LRCK. Reglage d'usine
+ * = maitre 96 kHz (BCK 6,144 MHz) ; OP2 court-circuite = maitre 48 kHz
+ * (BCK 3,072 MHz), reglage utilise ici. L'ESP32 est donc ESCLAVE I2S : BCK et
  * LRCK en entrees, MCLK inutilise (le piloter ou piloter BCK/LRCK creait un
  * conflit de sorties sur les memes fils). Indices au scope : DATA changeait
  * sur une grille de 163 ns = 1/6,144 MHz quel que soit le MCLK de l'ESP32.
- * La decimation 96 -> 16 kHz se fera en logiciel.
+ * La decimation 48 -> 16 kHz se fera en logiciel.
  *
  * Format : Philips I2S standard, stereo, 32 bits par slot. Le PCM1808 sort
  * un echantillon de 24 bits cale a gauche (MSB first) dans chaque slot de
@@ -35,15 +36,15 @@
 
 static const char *TAG = "i2s_test";
 
-#define I2S_SAMPLE_RATE_HZ   96000
+#define I2S_SAMPLE_RATE_HZ   48000
 #define I2S_BCLK_GPIO        GPIO_NUM_5
 #define I2S_WS_GPIO          GPIO_NUM_6
 #define I2S_DIN_GPIO         GPIO_NUM_7
 
-/* 256 echantillons par lecture (~2,7 ms a 96 kHz), niveau affiche toutes
- * les 188 lectures (~0,5 s). */
+/* 256 echantillons par lecture (~5,3 ms a 48 kHz), niveau affiche toutes
+ * les 94 lectures (~0,5 s). */
 #define FRAMES_PER_READ      256
-#define PRINT_PERIOD_BLOCKS  188
+#define PRINT_PERIOD_BLOCKS  94
 
 /* Pleine echelle d'un echantillon 24 bits signe (apres le >>8). */
 #define FULL_SCALE_24BIT     8388607.0
