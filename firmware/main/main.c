@@ -15,7 +15,8 @@
  * LRCK en entrees, MCLK inutilise (le piloter ou piloter BCK/LRCK creait un
  * conflit de sorties sur les memes fils). Indices au scope : DATA changeait
  * sur une grille de 163 ns = 1/6,144 MHz quel que soit le MCLK de l'ESP32.
- * La decimation 48 -> 16 kHz se fera en logiciel.
+ * Decimation 48 -> 16 kHz : FIR 80 coefficients (fir_48k_16k.h) via le
+ * decimateur optimise d'ESP-DSP (dsps_fird_f32).
  *
  * Format : Philips I2S standard, stereo, 32 bits par slot. Le PCM1808 sort
  * un echantillon de 24 bits cale a gauche (MSB first) dans chaque slot de
@@ -31,8 +32,11 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_cpu.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#include "dsps_fir.h"
+#include "fir_48k_16k.h"
 
 static const char *TAG = "i2s_test";
 
@@ -41,13 +45,66 @@ static const char *TAG = "i2s_test";
 #define I2S_WS_GPIO          GPIO_NUM_6
 #define I2S_DIN_GPIO         GPIO_NUM_7
 
-/* 256 echantillons par lecture (~5,3 ms a 48 kHz), niveau affiche toutes
- * les 94 lectures (~0,5 s). */
-#define FRAMES_PER_READ      256
-#define PRINT_PERIOD_BLOCKS  94
+#define DECIM                3
+/* 240 echantillons par lecture (5 ms a 48 kHz, multiple de DECIM), niveau
+ * affiche toutes les 100 lectures (0,5 s). */
+#define FRAMES_PER_READ      240
+#define OUT_PER_READ         (FRAMES_PER_READ / DECIM)
+#define PRINT_PERIOD_BLOCKS  100
 
 /* Pleine echelle d'un echantillon 24 bits signe (apres le >>8). */
-#define FULL_SCALE_24BIT     8388607.0
+#define FULL_SCALE_24BIT     8388608.0f
+#define CPU_HZ               (CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000.0)
+
+/* Ligne a retard du FIR : N + 4 et alignee sur 16 octets (exigence de la
+ * version ESP32-S3 optimisee de dsps_fird_f32). */
+static float s_fir_delay[FIR_48K_16K_TAPS + 4] __attribute__((aligned(16)));
+
+static double
+to_dbfs(double v)
+{
+    return v > 0.0 ? 20.0 * log10(v) : -INFINITY;
+}
+
+/* Fait passer des sinusoides synthetiques d'amplitude connue dans une instance
+ * separee du filtre et affiche le gain mesure : verifie la reponse du filtre
+ * sur la cible, independamment du signal audio reel. */
+static void
+fir_self_test(void)
+{
+    static float delay[FIR_48K_16K_TAPS + 4] __attribute__((aligned(16)));
+    static float in[FRAMES_PER_READ] __attribute__((aligned(16)));
+    static float out[OUT_PER_READ] __attribute__((aligned(16)));
+    const float freqs[] = {1000, 5000, 7000, 7500, 9000, 10000, 15000, 20000};
+    const float amplitude = 0.5f;
+
+    for (size_t k = 0; k < sizeof(freqs) / sizeof(freqs[0]); k++) {
+        fir_f32_t fir;
+        ESP_ERROR_CHECK(dsps_fird_init_f32(&fir, fir_48k_16k_coeffs, delay, FIR_48K_16K_TAPS, DECIM));
+        double phase = 0.0;
+        double step = 2.0 * M_PI * freqs[k] / I2S_SAMPLE_RATE_HZ;
+        double sum_sq = 0.0;
+        int n = 0;
+        for (int b = 0; b < 40; b++) {
+            for (int i = 0; i < FRAMES_PER_READ; i++) {
+                in[i] = amplitude * (float)sin(phase);
+                phase += step;
+                if (phase > 2.0 * M_PI) {
+                    phase -= 2.0 * M_PI;
+                }
+            }
+            int nout = dsps_fird_f32(&fir, in, out, OUT_PER_READ);
+            if (b >= 4) { /* ignore le regime transitoire (80 coefficients < 4 blocs) */
+                for (int j = 0; j < nout; j++) {
+                    sum_sq += (double)out[j] * out[j];
+                    n++;
+                }
+            }
+        }
+        double gain_db = to_dbfs(sqrt(sum_sq / n) / (amplitude / M_SQRT2));
+        ESP_LOGI(TAG, "auto-test FIR : %5.0f Hz -> %6.1f dB", freqs[k], gain_db);
+    }
+}
 
 static void
 i2s_capture_task(void *arg)
@@ -87,19 +144,22 @@ i2s_capture_task(void *arg)
     ESP_LOGI(TAG, "Capture I2S esclave demarree (Fs attendue=%d Hz, GPIO bclk=%d ws=%d din=%d)",
              I2S_SAMPLE_RATE_HZ, I2S_BCLK_GPIO, I2S_WS_GPIO, I2S_DIN_GPIO);
 
-    /* static plutot que sur la pile : evite de cumuler ce buffer (2 Ko) avec
-     * la profondeur d'appel de l'init I2S + printf - un premier essai avec
-     * une pile de tache de 4096 octets et ce buffer en automatique a
-     * provoque un stack overflow qui a corrompu le tas (crash retarde et
-     * sans rapport apparent, dans le idle task watchdog). */
-    static int32_t raw[FRAMES_PER_READ * 2]; /* stereo : L,R,L,R,... */
+    fir_f32_t fir;
+    ESP_ERROR_CHECK(dsps_fird_init_f32(&fir, fir_48k_16k_coeffs, s_fir_delay, FIR_48K_16K_TAPS, DECIM));
 
-    int64_t sum_sq = 0;
-    int32_t peak = 0;
-    int32_t min_val = INT32_MAX;
-    int32_t max_val = INT32_MIN;
+    /* static plutot que sur la pile : un premier essai avec une pile de tache
+     * de 4096 octets et le buffer brut en automatique a provoque un stack
+     * overflow qui a corrompu le tas (crash retarde, dans le idle task
+     * watchdog). */
+    static int32_t raw[FRAMES_PER_READ * 2]; /* stereo : L,R,L,R,... */
+    static float mono48[FRAMES_PER_READ] __attribute__((aligned(16)));
+    static float out16[OUT_PER_READ] __attribute__((aligned(16)));
+
+    double sum_sq48 = 0.0, sum_sq16 = 0.0;
+    float peak48 = 0.0f, peak16 = 0.0f;
     uint32_t clip_count = 0; /* echantillons a moins de 1% de la pleine echelle */
-    uint32_t total_frames = 0;
+    uint32_t frames48 = 0, frames16 = 0;
+    uint64_t fir_cycles = 0;
     int block_count = 0;
 
     while (1) {
@@ -109,58 +169,48 @@ i2s_capture_task(void *arg)
             ESP_LOGW(TAG, "i2s_channel_read: erreur %d (timeout ou surcharge)", err);
             continue;
         }
-
         size_t frames = bytes_read / (2 * sizeof(int32_t));
-
-        /* Dump brut des 8 premiers echantillons de CE bloc (L,R,L,R...), a
-         * chaque periode d'affichage (~0.5s) et pas seulement au boot - pour
-         * voir si la forme d'onde evolue de facon credible (variation lente,
-         * passages par zero) plutot que du bruit numerique incoherent. */
-        if (block_count == 0) {
-            ESP_LOGI(TAG, "mots bruts de ce bloc (L,R,L,R...) :");
-            for (size_t i = 0; i < 8 && i < frames * 2; i++) {
-                printf("  raw[%u] = 0x%08" PRIx32 "\n", (unsigned)i, (uint32_t)raw[i]);
-            }
-        }
 
         for (size_t i = 0; i < frames; i++) {
             int32_t left = raw[2 * i] >> 8;
             int32_t right = raw[2 * i + 1] >> 8;
-            int32_t mono = (left + right) / 2;
-
-            int32_t abs_mono = mono < 0 ? -mono : mono;
-            if (abs_mono > peak) {
-                peak = abs_mono;
+            float mono = (float)((left + right) / 2) / FULL_SCALE_24BIT;
+            float a = fabsf(mono);
+            if (a > peak48) {
+                peak48 = a;
             }
-            if (mono < min_val) {
-                min_val = mono;
-            }
-            if (mono > max_val) {
-                max_val = mono;
-            }
-            if (abs_mono > (int32_t)(FULL_SCALE_24BIT * 0.99)) {
+            if (a > 0.99f) {
                 clip_count++;
             }
-            sum_sq += (int64_t)mono * (int64_t)mono;
+            sum_sq48 += (double)mono * mono;
+            mono48[i] = mono;
         }
-        total_frames += frames;
-        block_count++;
+        frames48 += frames;
 
-        if (block_count >= PRINT_PERIOD_BLOCKS) {
-            double rms = (total_frames > 0) ? sqrt((double)sum_sq / (double)total_frames) : 0.0;
-            double peak_dbfs = (peak > 0) ? 20.0 * log10(peak / FULL_SCALE_24BIT) : -INFINITY;
-            double rms_dbfs = (rms > 0.0) ? 20.0 * log10(rms / FULL_SCALE_24BIT) : -INFINITY;
+        uint32_t t0 = esp_cpu_get_cycle_count();
+        int nout = dsps_fird_f32(&fir, mono48, out16, frames / DECIM);
+        fir_cycles += esp_cpu_get_cycle_count() - t0;
 
-            ESP_LOGI(TAG, "niveau mono : peak=%" PRId32 " (%.1f dBFS)  rms=%.0f (%.1f dBFS)  min=%" PRId32
-                      "  max=%" PRId32 "  clip=%" PRIu32 "/%u",
-                      peak, peak_dbfs, rms, rms_dbfs, min_val, max_val, clip_count, (unsigned)total_frames);
+        for (int j = 0; j < nout; j++) {
+            float a = fabsf(out16[j]);
+            if (a > peak16) {
+                peak16 = a;
+            }
+            sum_sq16 += (double)out16[j] * out16[j];
+        }
+        frames16 += nout;
 
-            sum_sq = 0;
-            peak = 0;
-            min_val = INT32_MAX;
-            max_val = INT32_MIN;
+        if (++block_count >= PRINT_PERIOD_BLOCKS) {
+            double cpu_pct = 100.0 * fir_cycles / (frames48 / (double)I2S_SAMPLE_RATE_HZ * CPU_HZ);
+            ESP_LOGI(TAG, "48 kHz: pic %.1f rms %.1f dBFS clip %" PRIu32 " | 16 kHz: pic %.1f rms %.1f dBFS"
+                     " (%" PRIu32 " ech.) | FIR %.2f %% CPU",
+                     to_dbfs(peak48), to_dbfs(sqrt(sum_sq48 / frames48)), clip_count,
+                     to_dbfs(peak16), to_dbfs(sqrt(sum_sq16 / frames16)), frames16, cpu_pct);
+            sum_sq48 = sum_sq16 = 0.0;
+            peak48 = peak16 = 0.0f;
             clip_count = 0;
-            total_frames = 0;
+            frames48 = frames16 = 0;
+            fir_cycles = 0;
             block_count = 0;
         }
     }
@@ -169,5 +219,6 @@ i2s_capture_task(void *arg)
 void
 app_main(void)
 {
+    fir_self_test();
     xTaskCreate(i2s_capture_task, "i2s_capture", 8192, NULL, 10, NULL);
 }

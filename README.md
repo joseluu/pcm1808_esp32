@@ -2,9 +2,11 @@
 
 Base de départ pour interfacer un breakout ADC stéréo **PCM1808** (carte marquée
 « GLA ANA TO I2S 96K/24BIT ») avec un **ESP32-S3** sous ESP-IDF. Le firmware capture le flux
-I2S 24 bits stéréo, le réduit en mono et affiche toutes les ~0,5 s le niveau (peak, RMS en dBFS,
-min/max, nombre d'échantillons écrêtés) ainsi que quelques mots bruts — de quoi valider le
-câblage et la chaîne avant d'y brancher un traitement réel.
+I2S 24 bits stéréo à 48 kHz, le réduit en mono, le **décime à 16 kHz** (filtre FIR via
+ESP-DSP) et affiche toutes les 0,5 s le niveau (pic et RMS en dBFS) avant et après décimation,
+le nombre d'échantillons écrêtés et la charge CPU du filtre. Au démarrage, un auto-test mesure
+la réponse du filtre sur des sinusoïdes synthétiques. De quoi valider le câblage et la chaîne
+avant d'y brancher un traitement réel (ici, un encodeur G.722 qui attend du 16 kHz).
 
 Il est issu d'un projet de relais audio TV → aides auditives Bluetooth (ASHA), où il sert à
 capter la sortie analogique de la TV. Ce dépôt ne contient que la partie capture, autonome.
@@ -103,6 +105,30 @@ note bottom of PCM : MCLK NON connecté\n(diaphonie sur BCLK)
   bruts doit valoir `0x00` — c'est un bon test de cohérence.
 - `sample_rate_hz` doit correspondre à la fréquence imposée par la carte (96000 ou 48000).
 
+## Décimation 48 → 16 kHz
+
+- Filtre FIR à phase linéaire, **80 coefficients**, calculé avec `scipy.signal.remez`
+  (table dans `firmware/main/fir_48k_16k.h`) :
+  bande passante 0–7 kHz (ondulation 0,05 dB), bande coupée à partir de 9 kHz (≥ 70 dB).
+- Pourquoi 9 kHz et pas 8 kHz (la fréquence de Nyquist à 16 kHz) : après décimation, une
+  composante entre 8 et 9 kHz se replie entre 7 et 8 kHz, hors de la bande utile visée
+  (50–7000 Hz pour le G.722). Une coupure à 8 kHz demanderait environ 200 coefficients.
+- Exécuté par `dsps_fird_f32` de la bibliothèque **ESP-DSP** (`espressif/esp-dsp`, ajoutée par
+  le gestionnaire de composants via `firmware/main/idf_component.yml`). Sur ESP32-S3, la version
+  optimisée exige un nombre de coefficients multiple de 4 et des tableaux (coefficients et
+  ligne à retard) alignés sur 16 octets. Attention : son paramètre `len` est le nombre
+  d'échantillons **en sortie** (la fonction consomme `len × décimation` échantillons en entrée).
+- Coût mesuré : 1,9 % d'un cœur à 160 MHz. Retard : 0,8 ms.
+
+Auto-test au démarrage (gain mesuré sur la cible) :
+
+| Fréquence | 1, 5, 7 kHz | 7,5 kHz | 9 kHz | 10 kHz | 15 kHz | 20 kHz |
+|---|---|---|---|---|---|---|
+| Gain | 0,0 dB | -1,8 dB | -70,5 dB | -82,0 dB | -78,7 dB | -72,2 dB |
+
+Sur musique, le RMS à 16 kHz est 0,1 à 0,6 dB sous celui à 48 kHz (l'énergie est surtout sous
+7 kHz) et les pics 0,5 à 2,4 dB plus bas (transitoires aigus retirés).
+
 ## Construire et flasher
 
 PlatformIO, framework ESP-IDF (testé avec ESP-IDF 5.5.2) :
@@ -113,7 +139,8 @@ pio run -t upload
 pio device monitor
 ```
 
-Adapter `upload_port` / `monitor_port` dans `platformio.ini`. Le Supermini utilisé a une flash
+La première compilation télécharge ESP-DSP dans `firmware/managed_components/` (version figée
+par `dependencies.lock`). Adapter `upload_port` / `monitor_port` dans `platformio.ini`. Le Supermini utilisé a une flash
 embarquée de 4 Mo alors que le préréglage `esp32-s3-devkitc-1` en suppose 8 : d'où
 `board_build.flash_size = 4MB`.
 
@@ -172,5 +199,4 @@ Cadence exacte (24 064 échantillons toutes les 500 ms), 15 s consécutives sans
 
 ## Suite prévue
 
-- Décimation 48 → 16 kHz (filtre passe-bas + un échantillon sur trois) pour un encodeur G.722.
 - Envoi du flux vers un PC pour écoute.

@@ -2,3 +2,4 @@
 sdkconfig.*
 !sdkconfig.defaults
 .vscode/
+managed_components/
