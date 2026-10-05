@@ -5,8 +5,9 @@ Base de départ pour interfacer un breakout ADC stéréo **PCM1808** (carte marq
 I2S 24 bits stéréo à 48 kHz, le réduit en mono, le **décime à 16 kHz** (filtre FIR via
 ESP-DSP) et affiche toutes les 0,5 s le niveau (pic et RMS en dBFS) avant et après décimation,
 le nombre d'échantillons écrêtés et la charge CPU du filtre. Au démarrage, un auto-test mesure
-la réponse du filtre sur des sinusoïdes synthétiques. De quoi valider le câblage et la chaîne
-avant d'y brancher un traitement réel (ici, un encodeur G.722 qui attend du 16 kHz).
+la réponse du filtre sur des sinusoïdes synthétiques. Sur demande, il envoie le flux 16 kHz au
+PC par l'USB, où un script l'enregistre en WAV pour écoute. De quoi valider le câblage et la
+chaîne avant d'y brancher un traitement réel (ici, un encodeur G.722 qui attend du 16 kHz).
 
 Il est issu d'un projet de relais audio TV → aides auditives Bluetooth (ASHA), où il sert à
 capter la sortie analogique de la TV. Ce dépôt ne contient que la partie capture, autonome.
@@ -129,6 +130,34 @@ Auto-test au démarrage (gain mesuré sur la cible) :
 Sur musique, le RMS à 16 kHz est 0,1 à 0,6 dB sous celui à 48 kHz (l'énergie est surtout sous
 7 kHz) et les pics 0,5 à 2,4 dB plus bas (transitoires aigus retirés).
 
+## Écouter le flux sur le PC
+
+À la réception du caractère `S` sur le port USB-Serial/JTAG (le port USB natif du S3), le
+firmware coupe ses logs et envoie le flux 16 kHz en binaire, par trames de 5 ms :
+
+| Octets | Contenu |
+|---|---|
+| 0–3 | magic `A5 5A C3 3C` |
+| 4–5 | numéro de séquence (uint16, little-endian) — permet de détecter les pertes |
+| 6–7 | nombre d'échantillons (uint16, LE), 80 en régime normal |
+| 8… | échantillons mono int16 LE |
+
+Soit environ 33 ko/s. Le flux ne s'arrête qu'au redémarrage de la carte.
+
+Le script `firmware/tools/capture_wav.py` (dépendance `pyserial`, déclarée en tête pour `uv`)
+ouvre le port **sans activer DTR/RTS** (sur l'USB-Serial/JTAG de l'ESP32-S3, ces lignes
+pilotent le reset), envoie `S`, se resynchronise sur le magic, vérifie la continuité des
+numéros de séquence et écrit un WAV mono 16 bits à 16 kHz :
+
+```
+uv run firmware/tools/capture_wav.py COM15 10 capture_16k.wav
+```
+
+Résultat sur 10 s de musique : 2023 trames, aucune perdue ni resynchronisation, écoute propre.
+
+Note : avec `usb_serial_jtag_driver_install()`, le buffer de réception doit dépasser 64 octets
+(sinon `ESP_ERR_INVALID_ARG`).
+
 ## Construire et flasher
 
 PlatformIO, framework ESP-IDF (testé avec ESP-IDF 5.5.2) :
@@ -197,6 +226,3 @@ Cadence exacte (24 064 échantillons toutes les 500 ms), 15 s consécutives sans
    que les pinces de masse des sondes ne sont pas reliées au GND du montage. Corriger avant de
    juger formes et niveaux.
 
-## Suite prévue
-
-- Envoi du flux vers un PC pour écoute.

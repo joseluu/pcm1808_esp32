@@ -35,6 +35,7 @@
 #include "esp_cpu.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#include "driver/usb_serial_jtag.h"
 #include "dsps_fir.h"
 #include "fir_48k_16k.h"
 
@@ -55,6 +56,13 @@ static const char *TAG = "i2s_test";
 /* Pleine echelle d'un echantillon 24 bits signe (apres le >>8). */
 #define FULL_SCALE_24BIT     8388608.0f
 #define CPU_HZ               (CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000000.0)
+
+/* Flux audio vers le PC (USB-Serial/JTAG) : demarre a la reception de 'S'.
+ * Trame : magic (4 octets) + sequence (uint16 LE) + nombre d'echantillons
+ * (uint16 LE) + echantillons int16 LE mono 16 kHz. Les logs sont coupes
+ * pendant le flux pour ne pas melanger texte et binaire. */
+static const uint8_t STREAM_MAGIC[4] = {0xA5, 0x5A, 0xC3, 0x3C};
+#define STREAM_HEADER_LEN    8
 
 /* Ligne a retard du FIR : N + 4 et alignee sur 16 octets (exigence de la
  * version ESP32-S3 optimisee de dsps_fird_f32). */
@@ -147,6 +155,13 @@ i2s_capture_task(void *arg)
     fir_f32_t fir;
     ESP_ERROR_CHECK(dsps_fird_init_f32(&fir, fir_48k_16k_coeffs, s_fir_delay, FIR_48K_16K_TAPS, DECIM));
 
+    usb_serial_jtag_driver_config_t usb_cfg = {.tx_buffer_size = 4096, .rx_buffer_size = 256};
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
+    bool streaming = false;
+    uint16_t stream_seq = 0;
+    static uint8_t frame[STREAM_HEADER_LEN + OUT_PER_READ * 2];
+    ESP_LOGI(TAG, "Envoyer 'S' sur le port USB pour demarrer le flux audio 16 kHz (binaire)");
+
     /* static plutot que sur la pile : un premier essai avec une pile de tache
      * de 4096 octets et le buffer brut en automatique a provoque un stack
      * overflow qui a corrompu le tas (crash retarde, dans le idle task
@@ -200,7 +215,31 @@ i2s_capture_task(void *arg)
         }
         frames16 += nout;
 
-        if (++block_count >= PRINT_PERIOD_BLOCKS) {
+        if (!streaming) {
+            uint8_t c;
+            if (usb_serial_jtag_read_bytes(&c, 1, 0) == 1 && c == 'S') {
+                ESP_LOGI(TAG, "Flux audio demarre, logs coupes");
+                vTaskDelay(pdMS_TO_TICKS(20));
+                esp_log_level_set("*", ESP_LOG_NONE);
+                streaming = true;
+            }
+        } else {
+            memcpy(frame, STREAM_MAGIC, 4);
+            frame[4] = stream_seq & 0xff;
+            frame[5] = stream_seq >> 8;
+            frame[6] = nout & 0xff;
+            frame[7] = nout >> 8;
+            for (int j = 0; j < nout; j++) {
+                float v = out16[j] * 32767.0f;
+                int32_t q = (int32_t)lrintf(v > 32767.0f ? 32767.0f : (v < -32768.0f ? -32768.0f : v));
+                frame[STREAM_HEADER_LEN + 2 * j] = q & 0xff;
+                frame[STREAM_HEADER_LEN + 2 * j + 1] = (q >> 8) & 0xff;
+            }
+            usb_serial_jtag_write_bytes(frame, STREAM_HEADER_LEN + 2 * nout, pdMS_TO_TICKS(20));
+            stream_seq++;
+        }
+
+        if (++block_count >= PRINT_PERIOD_BLOCKS && !streaming) {
             double cpu_pct = 100.0 * fir_cycles / (frames48 / (double)I2S_SAMPLE_RATE_HZ * CPU_HZ);
             ESP_LOGI(TAG, "48 kHz: pic %.1f rms %.1f dBFS clip %" PRIu32 " | 16 kHz: pic %.1f rms %.1f dBFS"
                      " (%" PRIu32 " ech.) | FIR %.2f %% CPU",
