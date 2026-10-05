@@ -59,9 +59,10 @@ Choix retenu : **maître 48 kHz (OP2 court-circuité), I2S 24 bits (OP1 ouvert)*
 - 48 kHz plutôt que 96 kHz : BCK deux fois plus lent, donc moins sensible à la diaphonie dans
   une nappe, et une décimation vers 16 kHz par 3 seulement.
 
-> **État du firmware de ce dépôt** : il est réglé pour le **réglage d'usine (96 kHz)**, seul
-> configuration validée à ce jour. Après avoir court-circuité OP2, passer `I2S_SAMPLE_RATE_HZ`
-> à `48000` dans `firmware/main/main.c` (non encore testé).
+> **État du firmware de ce dépôt** : réglé pour **maître 48 kHz (OP2 court-circuité)**, validé.
+> Pour le réglage d'usine (96 kHz, tous les ponts ouverts), passer `I2S_SAMPLE_RATE_HZ` à `96000`
+> dans `firmware/main/main.c` (également validé). En esclave I2S, l'ESP32 suit les horloges
+> reçues : cette constante ne sert qu'à configurer le driver et l'affichage.
 
 ## Câblage
 
@@ -116,7 +117,9 @@ Adapter `upload_port` / `monitor_port` dans `platformio.ini`. Le Supermini utili
 embarquée de 4 Mo alors que le préréglage `esp32-s3-devkitc-1` en suppose 8 : d'où
 `board_build.flash_size = 4MB`.
 
-## Résultats mesurés (réglage d'usine, 96 kHz)
+## Résultats mesurés
+
+Maître 96 kHz (réglage d'usine) :
 
 | Condition | RMS | Pics |
 |---|---|---|
@@ -125,6 +128,15 @@ embarquée de 4 Mo alors que le préréglage `esp32-s3-devkitc-1` en suppose 8 :
 | Musique, prise casque d'un PC à 50 % | -24 à -36 dBFS | -12 à -24 dBFS, sans écrêtage |
 
 Cadence vérifiée (48 128 échantillons en ~505 ms), 20 s consécutives sans bloc corrompu.
+
+Maître 48 kHz (OP2 court-circuité) :
+
+| Condition | RMS | Pics |
+|---|---|---|
+| Entrées sans signal | -92 dBFS | -80 dBFS |
+| Musique, prise casque d'un PC à 50 % | -23 à -30 dBFS | -12 à -18 dBFS, sans écrêtage |
+
+Cadence exacte (24 064 échantillons toutes les 500 ms), 15 s consécutives sans bloc corrompu.
 
 ## Ce qu'on a appris en route
 
@@ -160,6 +172,5 @@ Cadence vérifiée (48 128 échantillons en ~505 ms), 20 s consécutives sans bl
 
 ## Suite prévue
 
-- Passage en maître 48 kHz (OP2) et validation.
 - Décimation 48 → 16 kHz (filtre passe-bas + un échantillon sur trois) pour un encodeur G.722.
 - Envoi du flux vers un PC pour écoute.
